@@ -4,6 +4,7 @@
 """
 
 import os
+import re
 
 # chroma 不上传数据
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
@@ -28,6 +29,7 @@ from llama_index.vector_stores.chroma import ChromaVectorStore  # 注意导入�
 
 # 导入增强型 Prompt 系统
 from enhanced_prompt_system import EnhancedPromptSystem
+from c_minus_error_analyzer import CMinusErrorAnalyzer
 
 # 日志
 logging.basicConfig(level=logging.INFO)
@@ -150,30 +152,71 @@ class EnhancedTopKLogSystem:
     def _build_enhanced_prompt(self, query: str, context: Dict) -> List[Dict]:
         """构建增强型 Prompt"""
         try:
-            # 使用增强型 Prompt 系统
+            # 强化岔路口：命中 C-- 词法/技术错误 → 使用 Analyzer
+            ql = (query or "").lower()
+            is_lexical = (
+                ("lexical analysis failed" in ql) or
+                ("mismatched float literal" in ql) or
+                ("nearby source" in ql and "float" in ql) or
+                ("float literal" in ql) or
+                (" 36.;" in ql or '"36.;"' in ql)
+            )
+            logger.info(f"DEBUG MESSAGE: ql contains lexical? {is_lexical}")
+            if is_lexical:
+                logger.info("DEBUG MESSAGE: ---> 检测到C--词法/技术错误，调用 CMinusErrorAnalyzer！（EnhancedTopKLogSystem）")
+                analyzer = CMinusErrorAnalyzer()
+                prompt_text = analyzer.build_prompt(query)
+
+                system_message = SystemMessagePromptTemplate.from_template(prompt_text)
+                user_message = HumanMessagePromptTemplate.from_template("""
+请严格依照上述条款与步骤作答，禁止给出与文档 1.1/1.2 无关的泛化建议。
+""")
+                prompt = ChatPromptTemplate.from_messages([system_message, user_message])
+                return prompt.format_prompt().to_messages()
+
+            # 使用增强型 Prompt 系统（并做后置净化）
             enhanced_prompt = self.prompt_system.build_enhanced_prompt(query, context)
-            
-            # 构建系统消息
+            enhanced_prompt = self._sanitize_prompt_text(enhanced_prompt)
+
             system_message = SystemMessagePromptTemplate.from_template(enhanced_prompt)
-            
-            # 构建用户消息（简化，因为主要逻辑在系统消息中）
             user_message = HumanMessagePromptTemplate.from_template("""
 请基于以上分析框架和上下文信息，对问题进行深入分析。
 """)
-            
-            # 创建提示词
-            prompt = ChatPromptTemplate.from_messages([
-                system_message,
-                user_message
-            ])
-            
+            prompt = ChatPromptTemplate.from_messages([system_message, user_message])
             return prompt.format_prompt().to_messages()
             
         except Exception as e:
             logger.error(f"增强型 Prompt 构建失败: {e}")
             # 回退到基础实现
             return self._build_fallback_prompt(query, context)
-    
+
+    def _sanitize_prompt_text(self, text: str) -> str:
+        """对非 Analyzer 路径的提示文本进行后置净化，统一课程要求。"""
+        if not isinstance(text, str):
+            return text
+        sanitized = text
+        # 将单行 'flex && gcc' 改为三行标准命令
+        sanitized = re.sub(r"flex\s+lexer\.l\s*&&\s*gcc\s+lex\.yy\.c\s*-o\s+lexer(?:\s*\S+)?",
+                           "flex lexer.l\ngcc lex.yy.c -o lexer",
+                           sanitized, flags=re.IGNORECASE)
+        # 统一运行命令与扩展名为 .c--
+        sanitized = re.sub(r"\./lexer\s+[^\s`\n]+",
+                           "./lexer your_test_file.c--  # 确认输出中无 <ERROR>",
+                           sanitized)
+        sanitized = sanitized.replace("your_test_file.c", "your_test_file.c--")
+        sanitized = sanitized.replace("test_fix.c", "test_fix.c--")
+        # 去除可能的 f/F 建议（保守替换常见示例）
+        sanitized = sanitized.replace("36f", "36.0").replace("36F", "36.0")
+        # 若没有代码块，则附加标准命令块（幂等）
+        if "flex lexer.l\ngcc lex.yy.c -o lexer" in sanitized and "./lexer your_test_file.c--" in sanitized and "```bash" not in sanitized:
+            block = """```bash
+flex lexer.l
+gcc lex.yy.c -o lexer
+./lexer your_test_file.c--  # 确认输出中无 <ERROR>
+```"""
+            sanitized += ("\n\n" + block)
+        return sanitized
+
     def _build_fallback_prompt(self, query: str, context: Dict) -> List[Dict]:
         """回退到基础 Prompt 实现"""
         # 系统消息 - 定义角色和任务
